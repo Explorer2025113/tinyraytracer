@@ -3,6 +3,11 @@
 #include <fstream>
 #include <algorithm>
 #include <cmath>
+#include <random>
+#include <chrono>
+#include <thread>
+#include <cstdint>
+#include <string>
 
 struct vec3 {
     float x=0, y=0, z=0;
@@ -62,6 +67,72 @@ vec3 refract(const vec3 &I, const vec3 &N, const float eta_t, const float eta_i=
     float eta = eta_i / eta_t;
     float k = 1 - eta*eta*(1 - cosi*cosi);
     return k<0 ? vec3{1,0,0} : I*eta + N*(eta*cosi - std::sqrt(k)); // k<0 = total reflection, no ray to refract. I refract it anyways, this has no physical meaning
+}
+
+static float randf() {
+    // OpenMP 并行下使用线程局部 RNG，避免 rand() 数据竞争
+    thread_local std::mt19937 rng(static_cast<uint32_t>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count() ^
+        std::hash<std::thread::id>{}(std::this_thread::get_id())
+    ));
+    thread_local std::uniform_real_distribution<float> dist(0.f, 1.f);
+    return dist(rng);
+}
+
+// 在单位圆盘内随机取点（z=0），用于透镜光圈采样
+vec3 random_in_unit_disk() {
+    while (true) {
+        vec3 p{randf()*2.f - 1.f, randf()*2.f - 1.f, 0.f};
+        if (p*p < 1.f) return p;
+    }
+}
+
+// --- Progressive lens sampling helpers (paper-inspired, thin-lens DOF) ---
+static uint32_t wang_hash(uint32_t a) {
+    a = (a ^ 61u) ^ (a >> 16u);
+    a = a + (a << 3u);
+    a = a ^ (a >> 4u);
+    a = a * 0x27d4eb2du;
+    a = a ^ (a >> 15u);
+    return a;
+}
+
+static float halton(uint32_t index, uint32_t base) {
+    // Radical inverse in the given base; returns value in [0,1).
+    float f = 1.f;
+    float r = 0.f;
+    while (index > 0) {
+        f /= (float)base;
+        r += f * (float)(index % base);
+        index /= base;
+    }
+    return r;
+}
+
+// Progressive disk sampling with a polar4-like quadrant split.
+// The sequence has the prefix property: samples [0..K) are a subset of [0..K2) for K < K2.
+vec3 progressive_in_unit_disk(const uint32_t sample_idx, const uint32_t scramble) {
+    // Low-discrepancy points in [0,1).
+    float u = halton(sample_idx ^ scramble, 2);
+    float v = halton(sample_idx ^ wang_hash(scramble), 3);
+
+    float r = std::sqrt(u);
+    float a = v * 4.f;               // map to one of 4 quadrants
+    int quad = (int)std::floor(a);  // 0..3
+    float phi = (a - quad) * (3.14159265358979323846f * 0.5f); // [0, pi/2)
+
+    float x = r * std::cos(phi);
+    float y = r * std::sin(phi);
+
+    // Rotate the point from first-quadrant to selected quadrant.
+    vec3 p;
+    switch (quad & 3) {
+        case 0: p = { x,  y, 0.f}; break;
+        case 1: p = {-y,  x, 0.f}; break;
+        case 2: p = {-x, -y, 0.f}; break;
+        default: p = { y, -x, 0.f}; break;
+    }
+    return p;
 }
 
 std::tuple<bool,float> ray_sphere_intersect(const vec3 &orig, const vec3 &dir, const Sphere &s) { // ret value is a pair [intersection found, distance]
@@ -124,20 +195,73 @@ vec3 cast_ray(const vec3 &orig, const vec3 &dir, const int depth=0) {
     return material.diffuse_color * diffuse_light_intensity * material.albedo[0] + vec3{1., 1., 1.}*specular_light_intensity * material.albedo[1] + reflect_color*material.albedo[2] + refract_color*material.albedo[3];
 }
 
-int main() {
-    constexpr int   width  = 1024;
-    constexpr int   height = 768;
-    constexpr float fov    = 1.05; // 60 degrees field of view in radians
-    std::vector<vec3> framebuffer(width*height);
+int main(int argc, char **argv) {
+    // Default parameters (can be overridden from UI via CLI).
+    int width = 1024;
+    int height = 768;
+    constexpr float fov = 1.05f; // 60 degrees field of view in radians
+    float aperture = 0.5f;
+    float focus_dist = 14.f;
+    std::string out_path = "out_progressive_dof.ppm";
+
+    for (int i = 1; i < argc; i++) {
+        std::string a(argv[i]);
+        auto next = [&](void) -> const char* { return (i + 1 < argc) ? argv[++i] : nullptr; };
+        if (a == "--width") {
+            const char* v = next();
+            if (v) width = std::stoi(v);
+        } else if (a == "--height") {
+            const char* v = next();
+            if (v) height = std::stoi(v);
+        } else if (a == "--aperture") {
+            const char* v = next();
+            if (v) aperture = std::stof(v);
+        } else if (a == "--focus_dist") {
+            const char* v = next();
+            if (v) focus_dist = std::stof(v);
+        } else if (a == "--out") {
+            const char* v = next();
+            if (v) out_path = v;
+        }
+    }
+
+    std::vector<vec3> framebuffer(width * height);
 #pragma omp parallel for
     for (int pix = 0; pix<width*height; pix++) { // actual rendering loop
         float dir_x =  (pix%width + 0.5) -  width/2.;
         float dir_y = -(pix/width + 0.5) + height/2.; // this flips the image at the same time
         float dir_z = -height/(2.*tan(fov/2.));
-        framebuffer[pix] = cast_ray(vec3{0,0,0}, vec3{dir_x, dir_y, dir_z}.normalized());
+        vec3 pinhole_dir = vec3{dir_x, dir_y, dir_z}.normalized();
+
+        vec3 focus_point = pinhole_dir * focus_dist;
+
+        vec3 ray_orig0{0.f, 0.f, 0.f};
+        auto [hit0, point0, N0, material0] = scene_intersect(ray_orig0, pinhole_dir);
+        float z = hit0 ? point0.norm() : 1e10f;
+
+        constexpr float rho = 1.4f;
+        float A = 2.f * aperture; // treat lens diameter as 2*aperture (our disk radius)
+        float coc = A * std::fabs(focus_dist - z) / std::max(z, 1e-3f);
+
+        float csharp = (2.f / (float)height) * focus_dist * std::tan(fov * 0.5f);
+
+        constexpr int samples1 = 4;
+        constexpr int samples2 = 8;
+        constexpr int samples3 = 16;
+        int lens_samples = (coc <= csharp) ? samples1 : ((coc <= rho * csharp) ? samples2 : samples3);
+
+        vec3 color{0,0,0};
+        uint32_t scramble = wang_hash((uint32_t)pix);
+        for (int s = 0; s < lens_samples; s++) {
+            vec3 lens_sample = progressive_in_unit_disk((uint32_t)s, scramble) * aperture;
+            vec3 ray_orig{lens_sample.x, lens_sample.y, 0.f};
+            vec3 ray_dir = (focus_point - ray_orig).normalized();
+            color = color + cast_ray(ray_orig, ray_dir);
+        }
+        framebuffer[pix] = color * (1.f / (float)lens_samples);
     }
 
-    std::ofstream ofs("./out.ppm", std::ios::binary);
+    std::ofstream ofs(out_path, std::ios::binary);
     ofs << "P6\n" << width << " " << height << "\n255\n";
     for (vec3 &color : framebuffer) {
         float max = std::max(1.f, std::max(color[0], std::max(color[1], color[2])));
