@@ -22,10 +22,6 @@ struct vec3 {
     vec3 normalized() const { return (*this)*(1.f/norm()); }
 };
 
-vec3 cross(const vec3 v1, const vec3 v2) {
-    return { v1.y*v2.z - v1.z*v2.y, v1.z*v2.x - v1.x*v2.z, v1.x*v2.y - v1.y*v2.x };
-}
-
 struct Material {
     float refractive_index = 1;
     float albedo[4] = {2,0,0,0};
@@ -70,7 +66,7 @@ vec3 refract(const vec3 &I, const vec3 &N, const float eta_t, const float eta_i=
 }
 
 static float randf() {
-    // OpenMP 并行下使用线程局部 RNG，避免 rand() 数据竞争
+    // Use thread-local RNG to avoid data races under OpenMP.
     thread_local std::mt19937 rng(static_cast<uint32_t>(
         std::chrono::high_resolution_clock::now().time_since_epoch().count() ^
         std::hash<std::thread::id>{}(std::this_thread::get_id())
@@ -79,7 +75,7 @@ static float randf() {
     return dist(rng);
 }
 
-// 在单位圆盘内随机取点（z=0），用于透镜光圈采样
+// Uniform random point in unit disk (z=0), used for lens sampling.
 vec3 random_in_unit_disk() {
     while (true) {
         vec3 p{randf()*2.f - 1.f, randf()*2.f - 1.f, 0.f};
@@ -202,7 +198,10 @@ int main(int argc, char **argv) {
     constexpr float fov = 1.05f; // 60 degrees field of view in radians
     float aperture = 0.5f;
     float focus_dist = 14.f;
+    int mode = 0; // 0=progressive, 1=fixed samples, 2=pinhole
+    int fixed_samples = 16;
     std::string out_path = "out_progressive_dof.ppm";
+    std::string out_stage_path;
 
     for (int i = 1; i < argc; i++) {
         std::string a(argv[i]);
@@ -222,10 +221,26 @@ int main(int argc, char **argv) {
         } else if (a == "--out") {
             const char* v = next();
             if (v) out_path = v;
+        } else if (a == "--mode") {
+            const char* v = next();
+            if (!v) continue;
+            std::string m(v);
+            if (m == "progressive") mode = 0;
+            else if (m == "fixed") mode = 1;
+            else if (m == "pinhole") mode = 2;
+        } else if (a == "--samples") {
+            const char* v = next();
+            if (v) fixed_samples = std::max(1, std::stoi(v));
+        } else if (a == "--out_stage") {
+            const char* v = next();
+            if (v) out_stage_path = v;
         }
     }
 
     std::vector<vec3> framebuffer(width * height);
+    const bool write_stage = !out_stage_path.empty();
+    std::vector<unsigned char> stagebuf;
+    if (write_stage) stagebuf.resize(width * height, 0);
 #pragma omp parallel for
     for (int pix = 0; pix<width*height; pix++) { // actual rendering loop
         float dir_x =  (pix%width + 0.5) -  width/2.;
@@ -235,30 +250,67 @@ int main(int argc, char **argv) {
 
         vec3 focus_point = pinhole_dir * focus_dist;
 
-        vec3 ray_orig0{0.f, 0.f, 0.f};
-        auto [hit0, point0, N0, material0] = scene_intersect(ray_orig0, pinhole_dir);
-        float z = hit0 ? point0.norm() : 1e10f;
+        int lens_samples = 1;
+        unsigned char stage_val = 0;
 
-        constexpr float rho = 1.4f;
-        float A = 2.f * aperture; // treat lens diameter as 2*aperture (our disk radius)
-        float coc = A * std::fabs(focus_dist - z) / std::max(z, 1e-3f);
+        if (mode == 2) {
+            // pinhole: single ray through lens center
+            lens_samples = 1;
+            stage_val = 0;
+        } else if (mode == 1) {
+            // fixed samples: always use user-provided sample count
+            lens_samples = std::max(1, fixed_samples);
+            stage_val = 255; // "all same quality tier" (for easy visualization)
+        } else {
+            // progressive: choose lens samples based on an estimated CoC size
+            vec3 ray_orig0{0.f, 0.f, 0.f};
+            auto hit_info = scene_intersect(ray_orig0, pinhole_dir);
+            bool hit0 = std::get<0>(hit_info);
+            vec3 point0 = std::get<1>(hit_info);
+            float z = hit0 ? point0.norm() : 1e10f;
 
-        float csharp = (2.f / (float)height) * focus_dist * std::tan(fov * 0.5f);
+            constexpr float rho = 1.4f;
+            float A = 2.f * aperture; // treat lens diameter as 2*aperture (our disk radius)
+            float coc = A * std::fabs(focus_dist - z) / std::max(z, 1e-3f);
 
-        constexpr int samples1 = 4;
-        constexpr int samples2 = 8;
-        constexpr int samples3 = 16;
-        int lens_samples = (coc <= csharp) ? samples1 : ((coc <= rho * csharp) ? samples2 : samples3);
+            float csharp = (2.f / (float)height) * focus_dist * std::tan(fov * 0.5f);
+
+            constexpr int samples1 = 4;
+            constexpr int samples2 = 8;
+            constexpr int samples3 = 16;
+            if (coc <= csharp) {
+                lens_samples = samples1;
+                stage_val = 85;   // 1/3
+            } else if (coc <= rho * csharp) {
+                lens_samples = samples2;
+                stage_val = 170;  // 2/3
+            } else {
+                lens_samples = samples3;
+                stage_val = 255;  // 3/3
+            }
+        }
 
         vec3 color{0,0,0};
         uint32_t scramble = wang_hash((uint32_t)pix);
+
         for (int s = 0; s < lens_samples; s++) {
-            vec3 lens_sample = progressive_in_unit_disk((uint32_t)s, scramble) * aperture;
-            vec3 ray_orig{lens_sample.x, lens_sample.y, 0.f};
+            vec3 ray_orig;
+            if (mode == 2) {
+                ray_orig = vec3{0.f, 0.f, 0.f};
+            } else if (mode == 1) {
+                vec3 lens_sample = random_in_unit_disk() * aperture;
+                ray_orig = vec3{lens_sample.x, lens_sample.y, 0.f};
+            } else {
+                vec3 lens_sample = progressive_in_unit_disk((uint32_t)s, scramble) * aperture;
+                ray_orig = vec3{lens_sample.x, lens_sample.y, 0.f};
+            }
+
             vec3 ray_dir = (focus_point - ray_orig).normalized();
             color = color + cast_ray(ray_orig, ray_dir);
         }
+
         framebuffer[pix] = color * (1.f / (float)lens_samples);
+        if (write_stage) stagebuf[pix] = stage_val;
     }
 
     std::ofstream ofs(out_path, std::ios::binary);
@@ -267,6 +319,14 @@ int main(int argc, char **argv) {
         float max = std::max(1.f, std::max(color[0], std::max(color[1], color[2])));
         for (int chan : {0,1,2})
             ofs << (char)(255 *  color[chan]/max);
+    }
+
+    if (write_stage) {
+        std::ofstream sfs(out_stage_path, std::ios::binary);
+        sfs << "P6\n" << width << " " << height << "\n255\n";
+        for (unsigned char v : stagebuf) {
+            sfs << (char)v << (char)v << (char)v;
+        }
     }
     return 0;
 }
