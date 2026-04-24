@@ -59,6 +59,7 @@ struct BvhNode {
     float bmax[3]{};
     int left{-1};
     int right{-1};
+    int split_axis{-1};
     int leaf_begin{-1};
     int leaf_count{0};
 };
@@ -95,6 +96,13 @@ inline int longest_axis(const float* bmin, const float* bmax) {
         return 1;
     }
     return 2;
+}
+
+inline float bb_surface_area(const float* bmin, const float* bmax) {
+    const float dx = std::max(0.f, bmax[0] - bmin[0]);
+    const float dy = std::max(0.f, bmax[1] - bmin[1]);
+    const float dz = std::max(0.f, bmax[2] - bmin[2]);
+    return 2.f * (dx * dy + dy * dz + dz * dx);
 }
 
 inline void copy_bb(BvhNode& n, const float* bmin, const float* bmax) {
@@ -142,9 +150,10 @@ inline bool aabb_ray(const float* bmin, const float* bmax, const Ray& r, float t
 inline bool tri_hit(const Tri& tri, const Ray& r, float t_min, float t_max, rt::SceneHit& out) {
     const Vec3 e1 = tri.v1 - tri.v0;
     const Vec3 e2 = tri.v2 - tri.v0;
+    const Vec3 geom_normal = cross(e1, e2);
     const Vec3 p = cross(r.dir, e2);
     const float det = dot(e1, p);
-    if (std::fabs(det) < 1e-20f) {
+    if (std::fabs(det) < 1e-8f) {
         return false;
     }
     const float inv_det = 1.f / det;
@@ -168,17 +177,17 @@ inline bool tri_hit(const Tri& tri, const Ray& r, float t_min, float t_max, rt::
     out.py = pos.y;
     out.pz = pos.z;
     const float w = 1.f - u - v;
-    Vec3 n = normalize(tri.n0 * w + tri.n1 * u + tri.n2 * v);
-    if (length(n) <= 1e-6f) {
-        n = normalize(cross(e1, e2));
+    const bool front_face = dot(geom_normal, r.dir) < 0.f;
+    Vec3 shading_n = normalize(tri.n0 * w + tri.n1 * u + tri.n2 * v);
+    if (length(shading_n) <= 1e-6f) {
+        shading_n = normalize(geom_normal);
     }
-    const bool front_face = dot(n, r.dir) < 0.f;
     if (!front_face) {
-        n = n * -1.f;
+        shading_n = shading_n * -1.f;
     }
-    out.nx = n.x;
-    out.ny = n.y;
-    out.nz = n.z;
+    out.nx = shading_n.x;
+    out.ny = shading_n.y;
+    out.nz = shading_n.z;
     out.front_face = front_face ? 1 : 0;
     Vec3 c = tri.c0 * w + tri.c1 * u + tri.c2 * v;
     if (c.x <= 1e-6f && c.y <= 1e-6f && c.z <= 1e-6f) {
@@ -209,13 +218,19 @@ bool trace_closest_leaf(int node_idx, const Ray& r, float t_min, float t_max, rt
         return any;
     }
     bool hit = false;
-    float cur_cap = best.t;
-    if (n.left >= 0) {
-        hit |= trace_closest_leaf(n.left, r, t_min, cur_cap, best);
+    int first = n.left;
+    int second = n.right;
+    if (n.left >= 0 && n.right >= 0 && n.split_axis >= 0) {
+        const float dir_axis = (&r.dir.x)[n.split_axis];
+        const bool ray_positive = dir_axis >= 0.f;
+        first = ray_positive ? n.left : n.right;
+        second = ray_positive ? n.right : n.left;
     }
-    cur_cap = best.t;
-    if (n.right >= 0) {
-        hit |= trace_closest_leaf(n.right, r, t_min, cur_cap, best);
+    if (first >= 0) {
+        hit |= trace_closest_leaf(first, r, t_min, best.t, best);
+    }
+    if (second >= 0) {
+        hit |= trace_closest_leaf(second, r, t_min, best.t, best);
     }
     return hit;
 }
@@ -235,10 +250,18 @@ bool any_hit_leaf(int node_idx, const Ray& r, float t_min, float t_max) {
         }
         return false;
     }
-    if (n.left >= 0 && any_hit_leaf(n.left, r, t_min, t_max)) {
+    int first = n.left;
+    int second = n.right;
+    if (n.left >= 0 && n.right >= 0 && n.split_axis >= 0) {
+        const float dir_axis = (&r.dir.x)[n.split_axis];
+        const bool ray_positive = dir_axis >= 0.f;
+        first = ray_positive ? n.left : n.right;
+        second = ray_positive ? n.right : n.left;
+    }
+    if (first >= 0 && any_hit_leaf(first, r, t_min, t_max)) {
         return true;
     }
-    if (n.right >= 0 && any_hit_leaf(n.right, r, t_min, t_max)) {
+    if (second >= 0 && any_hit_leaf(second, r, t_min, t_max)) {
         return true;
     }
     return false;
@@ -256,17 +279,139 @@ int build_bvh(std::vector<int>& ord, int begin, int end) {
         BvhNode leaf{};
         copy_bb(leaf, bmin, bmax);
         leaf.left = leaf.right = -1;
+        leaf.split_axis = -1;
         leaf.leaf_begin = begin;
         leaf.leaf_count = n;
         g_nodes.push_back(leaf);
         return static_cast<int>(g_nodes.size()) - 1;
     }
     const int axis = longest_axis(bmin, bmax);
-    const int mid = begin + n / 2;
-    std::nth_element(
-        ord.begin() + begin, ord.begin() + mid, ord.begin() + end,
-        [&](int ia, int ib) { return tri_centroid_axis(g_tris[static_cast<std::size_t>(ia)], axis) <
-                                      tri_centroid_axis(g_tris[static_cast<std::size_t>(ib)], axis); });
+
+    float cmin[3] = {1e30f, 1e30f, 1e30f};
+    float cmax[3] = {-1e30f, -1e30f, -1e30f};
+    for (int i = begin; i < end; ++i) {
+        const Tri& tri = g_tris[static_cast<std::size_t>(ord[static_cast<std::size_t>(i)])];
+        for (int k = 0; k < 3; ++k) {
+            const float c = tri_centroid_axis(tri, k);
+            cmin[k] = std::min(cmin[k], c);
+            cmax[k] = std::max(cmax[k], c);
+        }
+    }
+
+    int mid = begin + n / 2;
+    constexpr int kBins = 32;
+    const float cext = cmax[axis] - cmin[axis];
+    if (cext > 1e-8f) {
+        struct Bin {
+            float bmin[3]{1e30f, 1e30f, 1e30f};
+            float bmax[3]{-1e30f, -1e30f, -1e30f};
+            int count{0};
+        };
+        Bin bins[kBins];
+        const float inv = static_cast<float>(kBins) / cext;
+
+        for (int i = begin; i < end; ++i) {
+            const int tri_idx = ord[static_cast<std::size_t>(i)];
+            const Tri& tri = g_tris[static_cast<std::size_t>(tri_idx)];
+            const float c = tri_centroid_axis(tri, axis);
+            int bi = static_cast<int>((c - cmin[axis]) * inv);
+            bi = std::clamp(bi, 0, kBins - 1);
+            bins[bi].count += 1;
+            tri_expand_bounds(tri, bins[bi].bmin, bins[bi].bmax);
+        }
+
+        float lmin[kBins - 1][3];
+        float lmax[kBins - 1][3];
+        int lcount[kBins - 1];
+        float rmin[kBins - 1][3];
+        float rmax[kBins - 1][3];
+        int rcount[kBins - 1];
+
+        float run_lmin[3] = {1e30f, 1e30f, 1e30f};
+        float run_lmax[3] = {-1e30f, -1e30f, -1e30f};
+        int run_lcount = 0;
+        for (int i = 0; i < kBins - 1; ++i) {
+            if (bins[i].count > 0) {
+                for (int k = 0; k < 3; ++k) {
+                    run_lmin[k] = std::min(run_lmin[k], bins[i].bmin[k]);
+                    run_lmax[k] = std::max(run_lmax[k], bins[i].bmax[k]);
+                }
+                run_lcount += bins[i].count;
+            }
+            for (int k = 0; k < 3; ++k) {
+                lmin[i][k] = run_lmin[k];
+                lmax[i][k] = run_lmax[k];
+            }
+            lcount[i] = run_lcount;
+        }
+
+        float run_rmin[3] = {1e30f, 1e30f, 1e30f};
+        float run_rmax[3] = {-1e30f, -1e30f, -1e30f};
+        int run_rcount = 0;
+        for (int i = kBins - 1; i >= 1; --i) {
+            if (bins[i].count > 0) {
+                for (int k = 0; k < 3; ++k) {
+                    run_rmin[k] = std::min(run_rmin[k], bins[i].bmin[k]);
+                    run_rmax[k] = std::max(run_rmax[k], bins[i].bmax[k]);
+                }
+                run_rcount += bins[i].count;
+            }
+            const int s = i - 1;
+            for (int k = 0; k < 3; ++k) {
+                rmin[s][k] = run_rmin[k];
+                rmax[s][k] = run_rmax[k];
+            }
+            rcount[s] = run_rcount;
+        }
+
+        float best_cost = 1e30f;
+        int best_split = -1;
+        for (int s = 0; s < kBins - 1; ++s) {
+            if (lcount[s] <= 0 || rcount[s] <= 0) {
+                continue;
+            }
+            const float la = bb_surface_area(lmin[s], lmax[s]);
+            const float ra = bb_surface_area(rmin[s], rmax[s]);
+            const float cost = la * static_cast<float>(lcount[s]) + ra * static_cast<float>(rcount[s]);
+            if (cost < best_cost) {
+                best_cost = cost;
+                best_split = s;
+            }
+        }
+
+        if (best_split >= 0) {
+            const float split_pos =
+                cmin[axis] + (static_cast<float>(best_split + 1) / static_cast<float>(kBins)) * cext;
+            auto mid_it = std::partition(ord.begin() + begin, ord.begin() + end, [&](int tri_idx) {
+                return tri_centroid_axis(g_tris[static_cast<std::size_t>(tri_idx)], axis) < split_pos;
+            });
+            mid = static_cast<int>(mid_it - ord.begin());
+            if (mid <= begin || mid >= end) {
+                mid = begin + n / 2;
+                std::nth_element(
+                    ord.begin() + begin, ord.begin() + mid, ord.begin() + end,
+                    [&](int ia, int ib) {
+                        return tri_centroid_axis(g_tris[static_cast<std::size_t>(ia)], axis) <
+                               tri_centroid_axis(g_tris[static_cast<std::size_t>(ib)], axis);
+                    });
+            }
+        } else {
+            mid = begin + n / 2;
+            std::nth_element(
+                ord.begin() + begin, ord.begin() + mid, ord.begin() + end,
+                [&](int ia, int ib) {
+                    return tri_centroid_axis(g_tris[static_cast<std::size_t>(ia)], axis) <
+                           tri_centroid_axis(g_tris[static_cast<std::size_t>(ib)], axis);
+                });
+        }
+    } else {
+        mid = begin + n / 2;
+        std::nth_element(
+            ord.begin() + begin, ord.begin() + mid, ord.begin() + end,
+            [&](int ia, int ib) { return tri_centroid_axis(g_tris[static_cast<std::size_t>(ia)], axis) <
+                                          tri_centroid_axis(g_tris[static_cast<std::size_t>(ib)], axis); });
+    }
+
     const int left = build_bvh(ord, begin, mid);
     const int right = build_bvh(ord, mid, end);
     float lbmin[3], lbmax[3], rbmin[3], rbmax[3];
@@ -278,6 +423,7 @@ int build_bvh(std::vector<int>& ord, int begin, int end) {
     copy_bb(internal, mbmin, mbmax);
     internal.left = left;
     internal.right = right;
+    internal.split_axis = axis;
     internal.leaf_begin = -1;
     internal.leaf_count = 0;
     g_nodes.push_back(internal);

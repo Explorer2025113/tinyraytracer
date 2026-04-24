@@ -57,6 +57,19 @@ inline float schlick_reflectance(float cos_theta, float ior) {
     return r0 + (1.f - r0) * m * m * m * m * m;
 }
 
+inline float hit_epsilon(float t) {
+    return std::max(1e-4f, t * 1e-5f);
+}
+
+inline uint32_t wang_hash(uint32_t x) {
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u;
+    x = x ^ (x >> 4);
+    x *= 0x27d4eb2du;
+    x = x ^ (x >> 15);
+    return x;
+}
+
 struct Ray {
     Vec3 origin;
     Vec3 dir;
@@ -151,14 +164,18 @@ struct Lighting {
     float intensity{1.f};
 };
 
+inline Vec3 trace_sky(Vec3 dir) {
+    const float t = 0.5f * (normalize(dir).y + 1.f);
+    const Vec3 c0{0.02f, 0.04f, 0.12f};
+    const Vec3 c1{0.35f, 0.55f, 0.95f};
+    return c0 * (1.f - t) + c1 * t;
+}
+
 inline Vec3 trace(const NativeSphere* spheres, int sphere_count, const Ray& r, int depth,
                   const Lighting& lighting, Vec3 ambient) {
     Hit h{};
     if (!world_hit(spheres, sphere_count, r, 1e-3f, 1e30f, h)) {
-        const float t = 0.5f * (normalize(r.dir).y + 1.f);
-        const Vec3 c0{0.02f, 0.04f, 0.12f};
-        const Vec3 c1{0.35f, 0.55f, 0.95f};
-        return c0 * (1.f - t) + c1 * t;
+        return trace_sky(r.dir);
     }
 
     if (h.material == 1) {
@@ -166,7 +183,8 @@ inline Vec3 trace(const NativeSphere* spheres, int sphere_count, const Ray& r, i
             return {0.f, 0.f, 0.f};
         }
         const Vec3 refl_dir = reflect_in(r.dir, h.normal);
-        const Ray next{h.point + h.normal * 1e-3f, normalize(refl_dir)};
+        const float eps = hit_epsilon(h.t);
+        const Ray next{h.point + h.normal * eps, normalize(refl_dir)};
         const Vec3 incoming = trace(spheres, sphere_count, next, depth - 1, lighting, ambient);
         return mul(h.albedo, incoming);
     }
@@ -185,14 +203,15 @@ inline Vec3 trace(const NativeSphere* spheres, int sphere_count, const Ray& r, i
         const float reflect_prob = schlick_reflectance(cos_theta, ior_glass);
 
         const Vec3 refl_dir = normalize(reflect_in(unit_dir, h.normal));
-        const Ray refl_ray{h.point + refl_dir * 1e-3f, refl_dir};
+        const float eps = hit_epsilon(h.t);
+        const Ray refl_ray{h.point + refl_dir * eps, refl_dir};
         const Vec3 refl_col = trace(spheres, sphere_count, refl_ray, depth - 1, lighting, ambient);
         if (cannot_refract) {
             return mul(h.albedo, refl_col);
         }
 
         const Vec3 refr_dir = normalize(refract_in(unit_dir, h.normal, eta_ratio));
-        const Ray refr_ray{h.point + refr_dir * 1e-3f, refr_dir};
+        const Ray refr_ray{h.point + refr_dir * eps, refr_dir};
         const Vec3 refr_col = trace(spheres, sphere_count, refr_ray, depth - 1, lighting, ambient);
         return mul(h.albedo, refl_col * reflect_prob + refr_col * (1.f - reflect_prob));
     }
@@ -209,13 +228,29 @@ inline Vec3 trace(const NativeSphere* spheres, int sphere_count, const Ray& r, i
     } else {
         ldir = normalize(lighting.dir);
     }
-    const float ndl = std::max(0.f, dot(h.normal, ldir));
+    const float ndl = dot(h.normal, ldir);
     const Vec3 view_dir = normalize(r.dir * -1.f);
     const Vec3 half_vec = normalize(ldir + view_dir);
-    const float spec = std::pow(std::max(0.f, dot(h.normal, half_vec)), 48.f) * 0.22f;
-    const Ray shadow{h.point + h.normal * 1e-3f, ldir};
-    const bool occluded = world_hit_any(spheres, sphere_count, shadow, 1e-3f, max_shadow_t);
-    const float direct = occluded ? 0.f : ndl;
+    float spec_exp = 50.f;
+    float spec_strength = 0.16f;
+    if (h.material == 1) {
+        spec_exp = 512.f;
+        spec_strength = 0.06f;
+    } else if (h.material == 2) {
+        spec_exp = 125.f;
+        spec_strength = 0.18f;
+    }
+    const float spec =
+        (ndl > 0.f) ? (std::pow(std::max(0.f, dot(h.normal, half_vec)), spec_exp) * spec_strength)
+                    : 0.f;
+    float direct = 0.f;
+    if (ndl > 0.f) {
+        const float eps = hit_epsilon(h.t);
+        const Ray shadow{h.point + h.normal * eps, ldir};
+        if (!world_hit_any(spheres, sphere_count, shadow, 1e-3f, max_shadow_t)) {
+            direct = ndl;
+        }
+    }
     const Vec3 lit = ambient + lighting.color * (lighting.intensity * attenuation * direct);
     return mul(h.albedo, lit) + lighting.color * (lighting.intensity * attenuation * spec);
 }
@@ -239,15 +274,6 @@ inline void write_pixel_rgba_unity(unsigned char* buffer, int width, int /*heigh
     buffer[i + 1] = clamp_byte(linear_rgb.y);
     buffer[i + 2] = clamp_byte(linear_rgb.z);
     buffer[i + 3] = 255;
-}
-
-inline float chief_depth_along_view(const Ray& chief, const NativeSphere* spheres, int sphere_count,
-                                    const Vec3& w, const Vec3& origin) {
-    Hit h{};
-    if (!world_hit(spheres, sphere_count, chief, 1e-3f, 1e30f, h)) {
-        return 1e6f;
-    }
-    return std::max(1e-4f, dot(h.point - origin, w));
 }
 
 /// Blur metric for tiering (larger = more defocus). Thin-lens style: |1/z - 1/zf| scaled by aperture.
@@ -279,11 +305,13 @@ inline Vec3 heat_map_color(int spp) {
 
 /// Vogel / golden-angle disk: fewer "separated ghost" lobes than random rings at low spp.
 inline void lens_disk_vogel(int sample_index, int spp, float aperture_r, const Vec3& u_axis,
-                            const Vec3& v_axis, Vec3& offset) {
+                            const Vec3& v_axis, uint32_t pixel_scramble, Vec3& offset) {
     const float n = static_cast<float>(std::max(spp, 1));
     const float r = aperture_r * std::sqrt((static_cast<float>(sample_index) + 0.5f) / n);
     constexpr float golden_angle = 2.39996322972865332f; // pi * (3 - sqrt(5))
-    const float theta = golden_angle * static_cast<float>(sample_index);
+    constexpr float tau = 6.28318530717958647f;
+    const float phase = static_cast<float>(pixel_scramble & 0xFFFFu) * (tau / 65536.f);
+    const float theta = golden_angle * static_cast<float>(sample_index) + phase;
     offset = u_axis * (r * std::cos(theta)) + v_axis * (r * std::sin(theta));
 }
 
@@ -349,9 +377,10 @@ void RenderPinholeSpheres(int width, int height, unsigned char* buffer, const Na
     const float focus_dist = std::max(camera->focus_distance, 1e-2f);
     float t_lo = camera->coc_threshold_lo;
     float t_hi = camera->coc_threshold_hi;
-    // Smaller default t_lo -> fewer pixels stuck at 4 spp when slightly defocused (reduces quad-ghost).
+    // Tie threshold to projected pixel size so behavior stays consistent across resolutions.
     if (t_lo <= 0.f) {
-        t_lo = 0.14f * std::max(aperture_r, 0.02f);
+        const float pixel_scale = (2.f * std::tan(vfov * 0.5f)) / static_cast<float>(height);
+        t_lo = pixel_scale * focus_dist;
     }
     if (t_hi <= 0.f) {
         t_hi = 2.5f * t_lo;
@@ -372,8 +401,17 @@ void RenderPinholeSpheres(int width, int height, unsigned char* buffer, const Na
             const Vec3 dir_chief =
                 normalize(lower_left + horizontal * s + vertical * tpx - origin);
             const Ray chief{origin, dir_chief};
+            Hit chief_hit{};
+            if (!world_hit(spheres, sphere_count, chief, 1e-3f, 1e30f, chief_hit)) {
+                if (heat) {
+                    write_pixel_rgba_unity(buffer, width, height, x, y, {0.f, 0.f, 0.f});
+                } else {
+                    write_pixel_rgba_unity(buffer, width, height, x, y, trace_sky(dir_chief));
+                }
+                continue;
+            }
 
-            const float z_hit = chief_depth_along_view(chief, spheres, sphere_count, w, origin);
+            const float z_hit = std::max(1e-4f, dot(chief_hit.point - origin, w));
             const float coc = coc_metric(z_hit, focus_dist, aperture_r);
             const int spp = spp_tier(coc, t_lo, t_hi);
 
@@ -383,6 +421,8 @@ void RenderPinholeSpheres(int width, int height, unsigned char* buffer, const Na
             }
 
             Vec3 accum{0.f, 0.f, 0.f};
+            const uint32_t pixel_scramble =
+                wang_hash(static_cast<uint32_t>(y * width + x));
             const float denom_w = dot(dir_chief, w);
             Vec3 focal_point{};
             if (std::fabs(denom_w) < 1e-5f) {
@@ -394,7 +434,7 @@ void RenderPinholeSpheres(int width, int height, unsigned char* buffer, const Na
 
             for (int si = 0; si < spp; ++si) {
                 Vec3 lens_off{};
-                lens_disk_vogel(si, spp, aperture_r, u, v, lens_off);
+                lens_disk_vogel(si, spp, aperture_r, u, v, pixel_scramble, lens_off);
                 const Vec3 lens_pos = origin + lens_off;
                 const Vec3 dof_dir = normalize(focal_point - lens_pos);
                 // Bias along ray, not world forward: +w broke coplanar lens sampling and caused heavy doubling.
